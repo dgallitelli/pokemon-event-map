@@ -1,19 +1,16 @@
 // ==UserScript==
 // @name         Pokémon TCG SG Event Search – Map
 // @namespace    https://github.com/dgallitelli
-// @version      1.0.1
+// @version      1.2.0
 // @description  Shows a Google Maps–tiled map of the event search results below the search bar (no API key).
 // @match        https://asia.pokemon-card.com/sg/event-search/search*
 // @homepageURL  https://github.com/dgallitelli/pokemon-event-map
 // @downloadURL  https://raw.githubusercontent.com/dgallitelli/pokemon-event-map/main/pokemon-event-map.user.js
 // @updateURL    https://raw.githubusercontent.com/dgallitelli/pokemon-event-map/main/pokemon-event-map.user.js
 // @require      https://unpkg.com/leaflet@1.9.4/dist/leaflet.js
-// @resource     LEAFLET_CSS https://unpkg.com/leaflet@1.9.4/dist/leaflet.css
-// @grant        GM_xmlhttpRequest
-// @grant        GM_getValue
-// @grant        GM_setValue
-// @grant        GM_addStyle
-// @grant        GM_getResourceText
+// @grant        GM.xmlHttpRequest
+// @grant        GM.getValue
+// @grant        GM.setValue
 // @connect      www.onemap.gov.sg
 // @connect      nominatim.openstreetmap.org
 // @connect      asia.pokemon-card.com
@@ -30,14 +27,24 @@
   const eventLinks = [...document.querySelectorAll('.eventList a.eventLink')];
   if (!results || !eventLinks.length) return;
 
-  GM_addStyle(GM_getResourceText('LEAFLET_CSS'));
-  GM_addStyle(`
-    #pkm-map-wrap { margin: 16px auto; max-width: 1000px; }
+  // Only the async GM.* API is used: it is the subset shared by Tampermonkey and the iOS/macOS
+  // Userscripts app, which has no @resource, GM_addStyle or synchronous GM_getValue/GM_setValue.
+  const leafletCss = document.createElement('link');
+  leafletCss.rel = 'stylesheet';
+  leafletCss.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
+  document.head.appendChild(leafletCss);
+  const style = document.createElement('style');
+  // The wrapper's own stacking context keeps Leaflet's z-indexes (400-1000) inside the map,
+  // so the page's jQuery UI datepicker (z-index ~1) can draw over it.
+  style.textContent = `
+    #pkm-map-wrap { margin: 16px auto; max-width: 1000px; position: relative; z-index: 0; isolation: isolate; }
     #pkm-map { height: 420px; border-radius: 8px; border: 1px solid #ddd; }
     #pkm-map-status { font-size: 12px; color: #666; margin-top: 4px; }
+    .leaflet-bar a.pkm-locate { display: flex; align-items: center; justify-content: center; }
     .pkm-popup a { color: #1a5fb4; }
     .pkm-popup ul { margin: 4px 0 0; padding-left: 16px; max-height: 180px; overflow-y: auto; }
-  `);
+  `;
+  document.head.appendChild(style);
 
   const wrap = document.createElement('div');
   wrap.id = 'pkm-map-wrap';
@@ -51,6 +58,7 @@
     maxZoom: 20,
     attribution: 'Map data &copy; Google',
   }).addTo(map);
+  leafletCss.onload = () => map.invalidateSize();
 
   // Leaflet's default marker PNGs resolve relative to its CSS file, which breaks when the CSS
   // is injected inline; use a self-contained SVG pin instead.
@@ -64,18 +72,80 @@
       '<circle cx="13.5" cy="13.5" r="4.8" fill="#3B0A06"/></svg>',
   });
 
-  const cache = GM_getValue(CACHE_KEY, {});
-  const saveCache = () => GM_setValue(CACHE_KEY, cache);
+  // "You are here" dot: shown automatically if location permission is already granted for this site,
+  // otherwise on demand via the locate button (which triggers the browser's permission prompt).
+  let youMarker, youAccuracy, watchId = null, centerOnNextFix = false;
+  function onPosition({ coords }) {
+    const pos = [coords.latitude, coords.longitude];
+    if (!youMarker) {
+      youAccuracy = L.circle(pos, { radius: coords.accuracy, color: '#4285F4', weight: 1, fillOpacity: 0.12, interactive: false }).addTo(map);
+      youMarker = L.circleMarker(pos, { radius: 7, color: '#fff', weight: 2, fillColor: '#4285F4', fillOpacity: 1 })
+        .addTo(map).bindPopup('You are here');
+    } else {
+      youMarker.setLatLng(pos);
+      youAccuracy.setLatLng(pos).setRadius(coords.accuracy);
+    }
+    if (centerOnNextFix) {
+      centerOnNextFix = false;
+      map.setView(pos, Math.max(map.getZoom(), 14));
+    }
+  }
+  function startWatching(btn) {
+    if (watchId !== null) return;
+    watchId = navigator.geolocation.watchPosition(onPosition, (err) => {
+      navigator.geolocation.clearWatch(watchId);
+      watchId = null;
+      if (btn) btn.title = err.code === err.PERMISSION_DENIED ? 'Location permission denied' : 'Location unavailable';
+    }, { enableHighAccuracy: true, maximumAge: 60000 });
+  }
+
+  if (navigator.geolocation) {
+    const LocateControl = L.Control.extend({
+      options: { position: 'topleft' },
+      onAdd() {
+        const bar = L.DomUtil.create('div', 'leaflet-bar leaflet-control');
+        const btn = L.DomUtil.create('a', 'pkm-locate', bar);
+        btn.href = '#';
+        btn.role = 'button';
+        btn.title = 'Show my location';
+        btn.innerHTML = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#333" stroke-width="2">' +
+          '<circle cx="12" cy="12" r="4"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/><circle cx="12" cy="12" r="8"/></svg>';
+        L.DomEvent.disableClickPropagation(bar);
+        L.DomEvent.on(btn, 'click', (e) => {
+          L.DomEvent.preventDefault(e);
+          if (youMarker) map.setView(youMarker.getLatLng(), Math.max(map.getZoom(), 14));
+          else centerOnNextFix = true;
+          startWatching(btn);
+        });
+        return bar;
+      },
+    });
+    map.addControl(new LocateControl());
+    navigator.permissions?.query({ name: 'geolocation' })
+      .then((p) => { if (p.state === 'granted') startWatching(); })
+      .catch(() => {});
+  }
+
+  let cache = {};
+  const saveCache = () => GM.setValue(CACHE_KEY, cache).catch(() => {});
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   function request(url, responseType = 'json') {
     return new Promise((resolve) => {
-      GM_xmlhttpRequest({
+      GM.xmlHttpRequest({
         method: 'GET',
         url,
         responseType,
         timeout: 15000,
-        onload: (r) => resolve(r.status === 200 ? r.response : null),
+        onload: (r) => {
+          if (r.status !== 200) return resolve(null);
+          let body = r.response ?? r.responseText;
+          // Some managers hand back JSON as a string despite responseType: 'json'.
+          if (responseType === 'json' && typeof body === 'string') {
+            try { body = JSON.parse(body); } catch { body = null; }
+          }
+          resolve(body);
+        },
         onerror: () => resolve(null),
         ontimeout: () => resolve(null),
       });
@@ -155,6 +225,7 @@
   const esc = (s) => s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
   async function run() {
+    cache = (await GM.getValue(CACHE_KEY, {}).catch(() => null)) || {};
     const events = eventLinks.map((a) => ({
       href: a.href,
       date: text(a, '.eventDate'),
